@@ -39,6 +39,11 @@ IMAGE_EXTS = {
     ".webp", ".heic", ".heif", ".raw", ".cr2", ".nef", ".arw", ".dng",
 }
 
+VIDEO_EXTS = {
+    ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".flv", ".webm",
+    ".mpg", ".mpeg", ".3gp", ".3g2", ".mts", ".m2ts", ".ts", ".vob",
+}
+
 # EXIF tag IDs we care about for date extraction.
 EXIF_DATETIME_ORIGINAL = 36867
 EXIF_DATETIME = 306
@@ -61,6 +66,10 @@ def md5_of_file(path: str) -> str:
 
 def is_image(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in IMAGE_EXTS
+
+
+def is_video(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTS
 
 
 def _parse_exif_date(value: str) -> tuple[int, int] | None:
@@ -124,15 +133,31 @@ def _human_bytes(n: float) -> str:
     return f"{n:.1f} EB"
 
 
+def _is_system_mount(mountpoint: str) -> bool:
+    """True if this mount is the OS install drive — never offer as a source."""
+    # Windows: %SystemDrive% is usually "C:". Compare case-insensitively.
+    sys_drive = (os.environ.get("SystemDrive") or "").upper().rstrip("\\/")
+    mp_upper = mountpoint.upper().rstrip("\\/")
+    if sys_drive and mp_upper == sys_drive:
+        return True
+    # Unix: '/' is the system root; also skip common system mounts seen on macOS.
+    if mountpoint == "/":
+        return True
+    if mountpoint.startswith(("/System", "/private", "/dev", "/usr", "/var")):
+        return True
+    return False
+
+
 def list_drives() -> list[dict]:
     """Return mounted drives suitable for display + selection.
 
     Each entry: {mountpoint, fstype, label}. Pseudo-filesystems are filtered
-    out by `all=False`. Unreadable mounts (e.g. empty CD drives on Windows)
-    are kept but reported with `free=None`.
+    out by `all=False`; the system drive is filtered by `_is_system_mount`.
     """
     drives: list[dict] = []
     for part in psutil.disk_partitions(all=False):
+        if _is_system_mount(part.mountpoint):
+            continue
         try:
             usage = psutil.disk_usage(part.mountpoint)
             free_str = f"{_human_bytes(usage.free)} free"
@@ -170,10 +195,11 @@ class CleanerWorker(threading.Thread):
         self.hash_map: dict[str, str] = {}
         self.stats = {
             "unique": 0,
+            "videos": 0,
             "duplicate": 0,
             "misc": 0,
             "errors": 0,
-            "skipped": 0,
+            "dirs_removed": 0,
         }
 
     # ---- queue helpers ----
@@ -222,10 +248,25 @@ class CleanerWorker(threading.Thread):
                 if self.cancel_event.is_set():
                     return
                 src = os.path.join(root_dir, name)
-                self._handle_file(src, name)
+                self._handle_file(src, name, drive)
+        if not self.cancel_event.is_set():
+            self._cleanup_empty_dirs(drive)
 
-    def _handle_file(self, src: str, name: str) -> None:
+    def _handle_file(self, src: str, name: str, drive: str) -> None:
         self._status(f"Processing {src}")
+
+        # Videos: skip MD5 entirely (per user — few videos, huge files, not
+        # worth the I/O). Route by mtime, no dedup.
+        if is_video(src):
+            year, month = get_mtime_date(src)
+            month_str = f"{month:02d}"
+            dest = os.path.join(self.dest_root, str(year), month_str, name)
+            self._log(f"[VIDEO] {name} -> {year}/{month_str}/")
+            self.stats["videos"] += 1
+            self._move_to(src, resolve_collision(dest))
+            return
+
+        # Everything else gets MD5'd for dedup.
         try:
             digest = md5_of_file(src)
         except (OSError, PermissionError) as exc:
@@ -237,20 +278,26 @@ class CleanerWorker(threading.Thread):
             dest = os.path.join(self.dest_root, "duplicates", name)
             self._log(f"[DUPLICATE] {name} -> duplicates/")
             self.stats["duplicate"] += 1
-        else:
+        elif is_image(src):
             self.hash_map[digest] = src
-            if is_image(src):
-                year, month = get_image_date(src) or get_mtime_date(src)
-                month_str = f"{month:02d}"
-                dest = os.path.join(self.dest_root, str(year), month_str, name)
-                self._log(f"[UNIQUE] {name} -> {year}/{month_str}/")
-                self.stats["unique"] += 1
-            else:
-                dest = os.path.join(self.dest_root, "misc", name)
-                self._log(f"[MISC] {name} -> misc/")
-                self.stats["misc"] += 1
+            year, month = get_image_date(src) or get_mtime_date(src)
+            month_str = f"{month:02d}"
+            dest = os.path.join(self.dest_root, str(year), month_str, name)
+            self._log(f"[UNIQUE] {name} -> {year}/{month_str}/")
+            self.stats["unique"] += 1
+        else:
+            # Misc: mirror the relative path from the source drive root so
+            # folder context (e.g. projb/) is preserved under misc/.
+            self.hash_map[digest] = src
+            rel = os.path.relpath(src, drive)
+            dest = os.path.join(self.dest_root, "misc", rel)
+            rel_dir = os.path.dirname(rel) or "."
+            self._log(f"[MISC] {name} -> misc/{rel_dir}/")
+            self.stats["misc"] += 1
 
-        dest = resolve_collision(dest)
+        self._move_to(src, resolve_collision(dest))
+
+    def _move_to(self, src: str, dest: str) -> None:
         if self.dry_run:
             return
         try:
@@ -259,6 +306,32 @@ class CleanerWorker(threading.Thread):
         except (OSError, shutil.Error) as exc:
             self._log(f"[ERROR] moving {src} -> {dest}: {exc}")
             self.stats["errors"] += 1
+
+    def _cleanup_empty_dirs(self, drive: str) -> None:
+        """Bottom-up walk: remove folders that are empty after the main pass."""
+        drive_abs = os.path.abspath(drive)
+        for root_dir, _dirs, _files in os.walk(drive, topdown=False):
+            if self.cancel_event.is_set():
+                return
+            root_norm = os.path.normcase(root_dir)
+            # Never touch the destination subtree.
+            if root_norm == self._dest_norm:
+                continue
+            if root_norm.startswith(self._dest_norm + os.sep):
+                continue
+            # Never delete the drive root itself.
+            if os.path.abspath(root_dir) == drive_abs:
+                continue
+            try:
+                if not os.listdir(root_dir):
+                    if self.dry_run:
+                        self._log(f"[CLEANUP] (dry) would remove empty {root_dir}")
+                    else:
+                        os.rmdir(root_dir)
+                        self._log(f"[CLEANUP] removed empty {root_dir}")
+                        self.stats["dirs_removed"] += 1
+            except OSError as exc:
+                self._log(f"[ERROR] cleanup {root_dir}: {exc}")
 
 
 # ----------------------------------------------------------------------------
@@ -474,9 +547,11 @@ class CleanerApp:
         self._set_controls_running(False)
         self.status_var.set("Cancelled" if cancelled else "Done")
         summary = (
-            f"Unique: {stats['unique']}   "
+            f"Images: {stats['unique']}   "
+            f"Videos: {stats['videos']}   "
             f"Duplicates: {stats['duplicate']}   "
             f"Misc: {stats['misc']}   "
+            f"Empty dirs removed: {stats['dirs_removed']}   "
             f"Errors: {stats['errors']}"
         )
         self._append_log("=== " + ("Cancelled" if cancelled else "Finished") + " ===")
