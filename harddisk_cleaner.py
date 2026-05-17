@@ -166,6 +166,7 @@ class CleanerWorker(threading.Thread):
         self.dry_run = dry_run
         self.queue = msg_queue
         self.cancel_event = cancel_event
+        self._dest_norm = os.path.normcase(self.dest_root)
         self.hash_map: dict[str, str] = {}
         self.stats = {
             "unique": 0,
@@ -196,22 +197,27 @@ class CleanerWorker(threading.Thread):
             self.queue.put(("done", dict(self.stats), self.cancel_event.is_set()))
 
     def _validate(self) -> None:
-        # Guard against destination living inside a source drive — would cause
-        # us to re-process already-moved files into an infinite loop.
-        dest = os.path.abspath(self.dest_root).rstrip(os.sep) + os.sep
+        # Same-drive destinations are fine — _process_drive prunes the dest
+        # subtree from os.walk so we never re-process our own output.
+        # Only refuse the nonsensical case where dest IS a source drive root.
         for drive in self.drives:
-            drv = os.path.abspath(drive).rstrip(os.sep) + os.sep
-            if dest.startswith(drv):
+            if os.path.normcase(os.path.abspath(drive)) == self._dest_norm:
                 raise ValueError(
-                    f"Destination {self.dest_root!r} is inside source drive "
-                    f"{drive!r}; choose a destination outside selected drives."
+                    f"Destination {self.dest_root!r} is the same as source "
+                    f"drive {drive!r}; pick a subfolder or different drive."
                 )
 
     def _process_drive(self, drive: str) -> None:
         self._status(f"Scanning {drive}")
         self._log(f"[SCAN] {drive}")
         on_error = lambda err: self._log(f"[SKIP] {err}")
-        for root_dir, _dirs, files in os.walk(drive, onerror=on_error):
+        for root_dir, dirs, files in os.walk(drive, onerror=on_error):
+            # Prune destination subtree in-place so os.walk never descends
+            # into it — prevents re-processing already-moved files.
+            dirs[:] = [
+                d for d in dirs
+                if os.path.normcase(os.path.join(root_dir, d)) != self._dest_norm
+            ]
             for name in files:
                 if self.cancel_event.is_set():
                     return
