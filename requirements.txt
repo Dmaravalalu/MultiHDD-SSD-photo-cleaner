@@ -1,0 +1,4 @@
+pillow>=10.0
+pillow-heif>=0.16
+psutil>=5.9
+pyinstaller>=6.0
