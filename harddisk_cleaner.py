@@ -7,6 +7,7 @@ Designed to compile to a single Windows .exe via PyInstaller. See build.bat.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import queue
 import shutil
@@ -59,6 +60,9 @@ EXIF_DATETIME_ORIGINAL = 36867
 EXIF_DATETIME = 306
 
 QUEUE_POLL_MS = 100
+
+# Persisted hash map state file lives at the destination root.
+HASH_STATE_FILENAME = ".hdc_hash.json"
 
 
 # ----------------------------------------------------------------------------
@@ -228,6 +232,7 @@ class CleanerWorker(threading.Thread):
         self.queue = msg_queue
         self.cancel_event = cancel_event
         self._dest_norm = os.path.normcase(self.dest_root)
+        self._hash_state_path = os.path.join(self.dest_root, HASH_STATE_FILENAME)
         self.hash_map: dict[str, str] = {}
         self.stats = {
             "unique": 0,
@@ -250,6 +255,7 @@ class CleanerWorker(threading.Thread):
     def run(self) -> None:
         try:
             self._validate()
+            self._load_hash_state()
             for drive in self.drives:
                 if self.cancel_event.is_set():
                     break
@@ -257,7 +263,40 @@ class CleanerWorker(threading.Thread):
         except Exception as exc:  # pragma: no cover — last-resort safety net
             self._log(f"[FATAL] {exc}")
         finally:
+            if not self.dry_run:
+                self._save_hash_state()
             self.queue.put(("done", dict(self.stats), self.cancel_event.is_set()))
+
+    # ---- persistence ----
+    def _load_hash_state(self) -> None:
+        """Restore the hash_map from a previous run's JSON, if present.
+
+        Lets stop/resume keep its dedup memory. Missing or unreadable state
+        file is fine — we just start with an empty map.
+        """
+        try:
+            with open(self._hash_state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            loaded = data.get("hashes", {})
+            if isinstance(loaded, dict):
+                self.hash_map.update(loaded)
+                self._log(f"[STATE] Loaded {len(loaded)} known hashes from previous runs")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            self._log(f"[WARN] could not read {HASH_STATE_FILENAME}: {exc}")
+
+    def _save_hash_state(self) -> None:
+        """Persist the hash_map atomically (write tmp + rename)."""
+        try:
+            os.makedirs(self.dest_root, exist_ok=True)
+            tmp = self._hash_state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"hashes": self.hash_map}, f)
+            os.replace(tmp, self._hash_state_path)
+            self._log(f"[STATE] Saved {len(self.hash_map)} hashes to {HASH_STATE_FILENAME}")
+        except OSError as exc:
+            self._log(f"[WARN] could not save state: {exc}")
 
     def _validate(self) -> None:
         # Same-drive destinations are fine — _process_drive prunes the dest

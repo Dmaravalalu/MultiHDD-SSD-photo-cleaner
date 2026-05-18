@@ -19,7 +19,23 @@ import os
 import shutil
 import sys
 
-from harddisk_cleaner import is_system_folder_name
+# Inlined from harddisk_cleaner — kept in sync, so this script stays
+# importable without the GUI deps (tkinter / PIL).
+WINDOWS_SYSTEM_FOLDERS = {
+    "$recycle.bin", "recycler", "system volume information", "recovery",
+    "config.msi", "msocache", "$extend", "$attrdef", "documents and settings",
+    "perflogs", "programdata", "$winreagent", "windowsapps",
+}
+
+
+def is_system_folder_name(name: str) -> bool:
+    n = name.lower()
+    if n in WINDOWS_SYSTEM_FOLDERS:
+        return True
+    if n.startswith("found.") and n[6:].isdigit():
+        return True
+    return False
+
 
 # OS-generated nuisance files Windows / macOS scatter through any folder.
 JUNK_FILES = {"desktop.ini", "thumbs.db", ".ds_store"}
