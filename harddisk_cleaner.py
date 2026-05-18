@@ -10,6 +10,7 @@ import hashlib
 import os
 import queue
 import shutil
+import stat as _stat
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -44,6 +45,15 @@ VIDEO_EXTS = {
     ".mpg", ".mpeg", ".3gp", ".3g2", ".mts", ".m2ts", ".ts", ".vob",
 }
 
+# Hidden/system folders that exist on every Windows drive root. Never enter.
+WINDOWS_SYSTEM_FOLDERS = {
+    "$recycle.bin", "recycler", "system volume information", "recovery",
+    "config.msi", "msocache", "$extend", "$attrdef", "documents and settings",
+    "perflogs", "programdata", "$winreagent", "windowsapps",
+}
+
+_FILE_ATTRIBUTE_SYSTEM = getattr(_stat, "FILE_ATTRIBUTE_SYSTEM", 0)
+
 # EXIF tag IDs we care about for date extraction.
 EXIF_DATETIME_ORIGINAL = 36867
 EXIF_DATETIME = 306
@@ -70,6 +80,32 @@ def is_image(path: str) -> bool:
 
 def is_video(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in VIDEO_EXTS
+
+
+def is_system_folder_name(name: str) -> bool:
+    """True if `name` is a known Windows system folder (case-insensitive)."""
+    n = name.lower()
+    if n in WINDOWS_SYSTEM_FOLDERS:
+        return True
+    # FOUND.000, FOUND.001, ... left behind by chkdsk
+    if n.startswith("found.") and n[6:].isdigit():
+        return True
+    return False
+
+
+def has_system_attribute(path: str) -> bool:
+    """True if Windows marks the path with FILE_ATTRIBUTE_SYSTEM.
+
+    Returns False on non-Windows (where st_file_attributes doesn't exist) and
+    on any stat() failure.
+    """
+    if not _FILE_ATTRIBUTE_SYSTEM:
+        return False
+    try:
+        attrs = getattr(os.stat(path), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attrs & _FILE_ATTRIBUTE_SYSTEM)
 
 
 def _parse_exif_date(value: str) -> tuple[int, int] | None:
@@ -198,6 +234,7 @@ class CleanerWorker(threading.Thread):
             "videos": 0,
             "duplicate": 0,
             "misc": 0,
+            "skipped": 0,
             "errors": 0,
             "dirs_removed": 0,
         }
@@ -238,12 +275,19 @@ class CleanerWorker(threading.Thread):
         self._log(f"[SCAN] {drive}")
         on_error = lambda err: self._log(f"[SKIP] {err}")
         for root_dir, dirs, files in os.walk(drive, onerror=on_error):
-            # Prune destination subtree in-place so os.walk never descends
-            # into it — prevents re-processing already-moved files.
-            dirs[:] = [
-                d for d in dirs
-                if os.path.normcase(os.path.join(root_dir, d)) != self._dest_norm
-            ]
+            # Prune (a) the destination subtree so we never re-process our
+            # output, (b) Windows system folders like $RECYCLE.BIN.
+            pruned: list[str] = []
+            for d in dirs:
+                full = os.path.join(root_dir, d)
+                if os.path.normcase(full) == self._dest_norm:
+                    continue
+                if is_system_folder_name(d):
+                    self._log(f"[SKIP] system folder {full}")
+                    continue
+                pruned.append(d)
+            dirs[:] = pruned
+
             for name in files:
                 if self.cancel_event.is_set():
                     return
@@ -254,6 +298,13 @@ class CleanerWorker(threading.Thread):
 
     def _handle_file(self, src: str, name: str, drive: str) -> None:
         self._status(f"Processing {src}")
+
+        # OS-marked system files (e.g. Windows install artefacts on a data
+        # drive, NTFS metadata). Touching these is never the user's intent.
+        if has_system_attribute(src):
+            self._log(f"[SKIP] system file {src}")
+            self.stats["skipped"] += 1
+            return
 
         # Videos: skip MD5 entirely (per user — few videos, huge files, not
         # worth the I/O). Route by mtime, no dedup.
@@ -303,6 +354,23 @@ class CleanerWorker(threading.Thread):
         try:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.move(src, dest)
+            return
+        except PermissionError:
+            # Try clearing the read-only attribute (Windows: makes the file
+            # writable if it was marked read-only) and retry once.
+            try:
+                os.chmod(src, _stat.S_IWRITE)
+                shutil.move(src, dest)
+                return
+            except (OSError, shutil.Error):
+                pass
+            # Real ACL restriction, file in use, or restricted location.
+            # Skip cleanly — better than crashing the run.
+            self._log(
+                f"[ACCESS DENIED] {src}: file is in use, ACL-protected, "
+                f"or in a restricted location — skipped"
+            )
+            self.stats["skipped"] += 1
         except (OSError, shutil.Error) as exc:
             self._log(f"[ERROR] moving {src} -> {dest}: {exc}")
             self.stats["errors"] += 1
@@ -551,6 +619,7 @@ class CleanerApp:
             f"Videos: {stats['videos']}   "
             f"Duplicates: {stats['duplicate']}   "
             f"Misc: {stats['misc']}   "
+            f"Skipped: {stats['skipped']}   "
             f"Empty dirs removed: {stats['dirs_removed']}   "
             f"Errors: {stats['errors']}"
         )
